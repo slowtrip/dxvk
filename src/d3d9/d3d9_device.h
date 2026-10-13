@@ -1070,6 +1070,23 @@ namespace dxvk {
             UINT                    Height,
             IDirect3DTexture9**     ppTexture);
 
+    /**
+     * \brief Runs the NFSU clustered lighting passes
+     *
+     * Builds per-tile light lists and lamp haze from scene depth,
+     * then accumulates lamp light from those lists. The parameter
+     * layout is documented in d3d9_nfsu_compute.cpp.
+     */
+    HRESULT NfsuCluster(
+            IDirect3DBaseTexture9*  pDepth,
+            IDirect3DBaseTexture9*  pHeat,
+            IDirect3DBaseTexture9*  pLight,
+            IDirect3DBaseTexture9*  pHaze,
+            IDirect3DBaseTexture9*  pAtlas,
+      const float*                  pParams,
+      const float*                  pLights,
+            UINT                    LightCount);
+
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
     }
@@ -1588,6 +1605,18 @@ namespace dxvk {
 
     D3D9Initializer*                m_initializer = nullptr;
     D3D9FormatHelper*               m_converter   = nullptr;
+
+    // NFSU clustered lighting, created on first use
+    const DxvkPipelineLayout*       m_nfsuTileLayout   = nullptr;
+    VkPipeline                      m_nfsuTilePipe     = VK_NULL_HANDLE;
+    const DxvkPipelineLayout*       m_nfsuLightLayout  = nullptr;
+    VkPipeline                      m_nfsuLightPipe    = VK_NULL_HANDLE;
+    Rc<DxvkBuffer>                  m_nfsuLights;
+    Rc<DxvkBuffer>                  m_nfsuTiles;
+    uint32_t                        m_nfsuTileCount    = 0u;
+    bool                            m_nfsuLogged       = false;
+
+    void NfsuDestroy();
 
     D3D9FFShaderModuleSet           m_ffModules;
     D3D9SWVPEmulator                m_swvpEmulator;

@@ -1,0 +1,115 @@
+#version 450
+// NFSU clustered lighting, pass 2: lamp light from the per-tile lists, at HALF resolution (lamp light is soft).
+// View space: diffuse (wrap), Blinn specular (gloss by up-facing), no shadow maps. Lamps that the mod shades
+// itself with shadow maps are not in the light list.
+// Output: rgb = diffuse light sum, a = specular sum (luminance; tinted by the lamp colour in the composite).
+// Dual mode (par.z = 1): the image is twice the logical width and its right half gets the diffuse of the MOVING
+// lights only (car lights, police beacons: r0 < 0 in their record - r0 is only ever used squared), so the mod
+// can add them on baked ground, where the static lights come from the bake.
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D lightImg;   // half res
+layout(set = 0, binding = 1) uniform texture2D depthTex;
+struct Light { vec4 posRange; vec4 colR0; vec4 dirCos; vec4 extra; };
+layout(std430, set = 0, binding = 2) readonly buffer Lights { Light L[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Tiles { uint T[]; };
+layout(set = 0, binding = 4) uniform texture2D lsAtlas;   // baked STATIC shadow maps of up to 16 lamps (L16 linear depth codes)
+
+layout(push_constant) uniform PC {
+  vec4 par;   // x shininess, y spec on (1/0), z dual output (moving lights in the right half), w atlas: depth bias (m), 0 = off
+  vec4 proj;  // P00, P11, P22, P32
+  vec4 size;  // xy light image size, zw screen size
+  vec4 info;  // x light count, y tiles per row, z atlas tile size (px), w atlas tiles per row
+  vec4 up;    // world up (= world Z) in view space (gloss of up-facing surfaces), w atlas far - near (m)
+  vec4 ax;    // world X in view space, w atlas 1/tan(fov/2)
+  vec4 ay;    // world Y in view space, w atlas near (m)
+} pc;
+
+// atlas lamp (record extra.w = 6 + tile + 0.05 + 0.4 x weight): straight-down street lamp:
+// lamp-space x = -(world dx), y = world dy, depth = -(world dz); 2x2 PCF of the linear depth compare; 1 = lit
+float atlasVis(vec3 p, vec3 Lv, int t) {
+  vec3 d = p - Lv;
+  float wx = dot(d, pc.ax.xyz), wy = dot(d, pc.ay.xyz), zv = -dot(d, pc.up.xyz);
+  if (zv < pc.ay.w) return 1.0;
+  vec2 su = vec2(pc.ax.w * -wx / zv * 0.5 + 0.5, 0.5 - pc.ax.w * wy / zv * 0.5);
+  if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) return 1.0;
+  int ts = int(pc.info.z), tr = int(pc.info.w);
+  ivec2 org = ivec2(t % tr, t / tr) * ts;
+  vec2 tp = su * float(ts) - 0.5;
+  ivec2 b = ivec2(floor(tp));
+  vec2 f = tp - vec2(b);
+  float v[4];
+  for (int k = 0; k < 4; k++) {
+    ivec2 q = clamp(b + ivec2(k & 1, k >> 1), ivec2(0), ivec2(ts - 1)) + org;
+    float code = texelFetch(lsAtlas, q, 0).r * 65535.0;
+    float zm = pc.ay.w + code * (pc.up.w / 65534.0);
+    v[k] = code > 65534.5 || zm >= zv - pc.par.w ? 1.0 : 0.0;
+  }
+  return mix(mix(v[0], v[1], f.x), mix(v[2], v[3], f.x), f.y);
+}
+
+const uint MAXL = 64u;
+
+vec3 vpos(ivec2 p, out float z) {
+  float d = texelFetch(depthTex, clamp(p, ivec2(0), ivec2(pc.size.zw) - 1), 0).r;
+  z = pc.proj.w / (d - pc.proj.z);
+  vec2 uv = (vec2(p) + 0.5) / pc.size.zw;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  return vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z);
+}
+
+void main() {
+  ivec2 op = ivec2(gl_GlobalInvocationID.xy);
+  if (op.x >= int(pc.size.x) || op.y >= int(pc.size.y)) return;
+  ivec2 sp = op * 2;                                               // full-res pixel this texel stands for
+  float d = texelFetch(depthTex, sp, 0).r;
+  bool dual = pc.par.z > 0.5;
+  ivec2 opd = op + ivec2(int(pc.size.x), 0);
+  if (d >= 0.99999 || pc.info.x < 0.5) { imageStore(lightImg, op, vec4(0.0)); if (dual) imageStore(lightImg, opd, vec4(0.0)); return; }
+  float z, zl, zr, zu, zd;
+  vec3 p = vpos(sp, z);
+  // neighbours 2 px away = this texel's footprint: steadier normals under TAA jitter (less spec shimmer)
+  vec3 pl = vpos(sp - ivec2(2, 0), zl), pr = vpos(sp + ivec2(2, 0), zr);
+  vec3 pu = vpos(sp - ivec2(0, 2), zu), pd = vpos(sp + ivec2(0, 2), zd);
+  vec3 ex = abs(zr - z) < abs(z - zl) ? pr - p : p - pl;           // robust normal
+  vec3 ey = abs(zd - z) < abs(z - zu) ? pd - p : p - pu;
+  vec3 n = normalize(cross(ey, ex));
+  vec3 V = -normalize(p);
+  if (dot(n, V) < 0.0) n = -n;
+  float rough = clamp(min(abs(zr - z), abs(z - zl)) / z * 20.0 + min(abs(zd - z), abs(z - zu)) / z * 20.0, 0.0, 1.0);   // 2 px step
+  float specMask = (1.0 - rough) * pc.par.y;
+  float gloss = 0.35 + 0.65 * clamp(dot(n, pc.up.xyz) * 1.5 - 0.5, 0.0, 1.0);
+
+  uvec2 tile = uvec2(sp) / 16u;
+  uint base = (tile.y * uint(pc.info.y) + tile.x) * (MAXL + 1u);
+  uint cnt = T[base];
+  vec3 light = vec3(0.0), moving = vec3(0.0);
+  float spec = 0.0;
+  for (uint k = 0u; k < cnt; k++) {
+    Light Li = L[T[base + 1u + k]];
+    vec3 Lv = Li.posRange.xyz - p;
+    float d2 = dot(Lv, Lv);
+    float r2 = Li.posRange.w * Li.posRange.w;
+    if (d2 >= r2) continue;
+    float dist = sqrt(d2);
+    vec3 l = Lv / dist;
+    float win = clamp(1.0 - d2 / r2, 0.0, 1.0);
+    float atten = win * win / (1.0 + d2 / (Li.colR0.w * Li.colR0.w));
+    float spot = smoothstep(Li.dirCos.w, Li.extra.x, dot(-l, Li.dirCos.xyz));
+    float ndl = clamp(dot(n, l), 0.0, 1.0) * 0.85 + 0.15;
+    vec3 c = Li.colR0.rgb * (atten * spot);
+    if (pc.par.w > 0.0 && Li.extra.w > 5.5) {                         // baked static shadow of an atlas lamp
+      float e = Li.extra.w - 6.0;
+      int t = int(floor(e));
+      float w = clamp((e - float(t) - 0.05) / 0.4, 0.0, 1.0);
+      c *= mix(1.0, atlasVis(p, Li.posRange.xyz, t), w);
+    }
+    light += c * ndl;
+    if (Li.colR0.w < 0.0) moving += c * ndl;
+    vec3 h = normalize(l + V);
+    spec += dot(c, vec3(0.299, 0.587, 0.114)) * pow(clamp(dot(n, h), 0.0, 1.0), pc.par.x) * gloss * specMask;
+  }
+  imageStore(lightImg, op, vec4(light, spec));
+  if (dual) imageStore(lightImg, opd, vec4(moving, 0.0));
+}

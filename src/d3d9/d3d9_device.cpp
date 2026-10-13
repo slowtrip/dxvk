@@ -171,6 +171,8 @@ namespace dxvk {
     delete m_converter;
 
     m_dxvkDevice->waitForIdle(); // Sync Device
+
+    NfsuDestroy();
   }
 
 

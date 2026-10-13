@@ -309,4 +309,15 @@ extern "C" {
     return static_cast<D3D9DeviceEx*>(pDevice)->NfsuCreateStorageTexture(Width, Height, ppTexture);
   }
 
+  // Clustered lighting, see D3D9DeviceEx::NfsuCluster
+  DLLEXPORT HRESULT __stdcall NFSU_ClusterLighting(IDirect3DDevice9* pDevice, IDirect3DTexture9* pDepth,
+                                                   IDirect3DTexture9* pHeat, IDirect3DTexture9* pLight,
+                                                   IDirect3DTexture9* pHaze, IDirect3DTexture9* pAtlas,
+                                                   const float* pParams, const float* pLights, UINT LightCount) {
+    if (!pDevice)
+      return D3DERR_INVALIDCALL;
+
+    return static_cast<D3D9DeviceEx*>(pDevice)->NfsuCluster(pDepth, pHeat, pLight, pHaze, pAtlas, pParams, pLights, LightCount);
+  }
+
 }

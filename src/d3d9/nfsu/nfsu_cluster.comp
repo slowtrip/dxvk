@@ -1,0 +1,137 @@
+#version 450
+// NFSU clustered lighting, pass 1: per-tile light lists and per-tile lamp haze.
+// One 16x16 workgroup = one 16x16 px screen tile: min/max view depth of the tile -> view-space box ->
+// every light whose sphere reaches the box goes into the tile's list (max 64). Output: Tiles buffer
+// (count + indices per tile, for the lighting pass), the haze image and an optional heat map (lights
+// per tile) in outImg.
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D outImg;
+layout(set = 0, binding = 1) uniform texture2D depthTex;
+struct Light { vec4 posRange; vec4 colR0; vec4 dirCos; vec4 extra; };   // view space
+layout(std430, set = 0, binding = 2) readonly buffer Lights { Light L[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Tiles { uint T[]; };  // per tile: count, idx[MAXL]
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D hazeImg;  // two texels per tile (near, far)
+
+layout(push_constant) uniform PC {
+  vec4 par;   // x unused, y time (s), z heat map on, w haze on
+  vec4 proj;  // P00, P11, P22, P32: view z = P32 / (d - P22), view x = ndc.x * z / P00
+  vec4 size;  // xy debug image size, zw screen (depth) size
+  vec4 info;  // x light count, y tiles per row, z tiles per column, w sky ray length (m)
+} pc;
+
+const uint MAXL = 64u;
+shared uint sMin, sMax, sCount;
+shared uint sMask[8];                                              // hit bit per light (256): deterministic order
+shared uint sIdx[MAXL];
+shared vec3 sHaze[256], sHazeF[256];
+shared uint sSky;                                                  // tile has sky pixels
+
+// atan approximation, the same curve as in the mod's lamp pixel shader so both halves of the haze match
+float atan_a(float x) {
+  float ax = abs(x), t = ax > 1.0 ? 1.0 / ax : ax;
+  float r = 0.7853982 * t - t * (t - 1.0) * (0.2447 + 0.0663 * t);
+  r = ax > 1.0 ? 1.5707963 - r : r;
+  return x < 0.0 ? -r : r;
+}
+
+void main() {
+  ivec2 sp = ivec2(gl_GlobalInvocationID.xy);
+  bool inside = sp.x < int(pc.size.z) && sp.y < int(pc.size.w);
+  uint li = gl_LocalInvocationIndex;
+  if (li == 0u) { sMin = 0x7f7fffffu; sMax = 0u; sCount = 0u; sSky = 0u; }
+  if (li < 8u) sMask[li] = 0u;
+  barrier();
+
+  float z = 0.0;
+  if (inside) {
+    float d = texelFetch(depthTex, sp, 0).r;
+    if (d < 0.99999) {
+      z = pc.proj.w / (d - pc.proj.z);
+      atomicMin(sMin, floatBitsToUint(z));                       // positive floats sort like uints
+      atomicMax(sMax, floatBitsToUint(z));
+    } else sSky = 1u;                                              // benign race: every writer stores 1
+  }
+  barrier();
+
+  bool empty = sMax == 0u;                                         // sky only
+  float zmin = uintBitsToFloat(sMin), zmax = uintBitsToFloat(sMax);
+  uvec2 tile = gl_WorkGroupID.xy;
+  vec2 t0 = vec2(tile * 16u) / pc.size.zw, t1 = vec2(tile * 16u + 16u) / pc.size.zw;
+  vec2 s0 = vec2(t0.x * 2.0 - 1.0, 1.0 - t1.y * 2.0) / pc.proj.xy;   // x/z, y/z slopes of the tile edges
+  vec2 s1 = vec2(t1.x * 2.0 - 1.0, 1.0 - t0.y * 2.0) / pc.proj.xy;
+  vec3 bmin = vec3(min(s0 * zmin, s0 * zmax), zmin);
+  vec3 bmax = vec3(max(s1 * zmin, s1 * zmax), zmax);
+
+  uint n = empty ? 0u : uint(pc.info.x);
+  for (uint i = li; i < n; i += 256u) {
+    vec4 pr = L[i].posRange;
+    vec3 q = clamp(pr.xyz, bmin, bmax) - pr.xyz;                  // sphere vs box
+    if (dot(q, q) < pr.w * pr.w) {
+      atomicOr(sMask[i >> 5u], 1u << (i & 31u));
+      atomicAdd(sCount, 1u);
+    }
+  }
+  // lamp haze for this tile: analytic in-scattering of every light (not only the listed ones) along the
+  // tile-centre ray, evaluated at the tile's NEAREST and FARTHEST depth (farthest = sky ray when the tile has
+  // sky). The mod's lamp shader interpolates between the two by each pixel's own depth: no 16 px blocks at depth edges
+  // (vents, poles, car silhouettes). Lights with extra.y > 0.5 (ceiling fixtures) add no haze.
+  vec3 hzN = vec3(0.0), hzF = vec3(0.0);
+  vec2 tc = (vec2(tile * 16u) + 8.0) / pc.size.zw;
+  vec3 rd = normalize(vec3((tc.x * 2.0 - 1.0) / pc.proj.x, (1.0 - tc.y * 2.0) / pc.proj.y, 1.0));
+  float zN = empty ? pc.info.w * rd.z : zmin;
+  float zF = (empty || sSky != 0u) ? pc.info.w * rd.z : zmax;
+  if (pc.par.w > 0.5) {
+    float tN = zN / rd.z, tF = zF / rd.z;
+    uint na = uint(pc.info.x);
+    for (uint i = li; i < na; i += 256u) {
+      if (L[i].extra.y > 0.5) continue;
+      vec4 pr = L[i].posRange;
+      float t0 = dot(pr.xyz, rd);
+      float hh = max(length(pr.xyz - rd * t0), 0.6);
+      float a0 = atan_a(-t0 / hh);
+      vec3 w = L[i].colR0.rgb * (clamp(1.0 - dot(pr.xyz, pr.xyz) / (pr.w * pr.w * 16.0), 0.0, 1.0) / hh);
+      hzN += w * (atan_a((tN - t0) / hh) - a0);
+      hzF += w * (atan_a((tF - t0) / hh) - a0);
+    }
+  }
+  sHaze[li] = hzN;
+  sHazeF[li] = hzF;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {                           // tree reduction of the 256 partial sums
+    if (li < s) { sHaze[li] += sHaze[li + s]; sHazeF[li] += sHazeF[li + s]; }
+    barrier();
+  }
+
+  // compact the hit bits in light order: the CPU sorts lights nearest first, so an overflowing tile always
+  // keeps the SAME (nearest) lights - an atomic append order would change every frame and flicker
+  if (li == 0u) {
+    uint k = 0u;
+    for (uint w = 0u; w < 8u && k < MAXL; w++) {
+      uint m = sMask[w];
+      while (m != 0u && k < MAXL) { int b = findLSB(m); sIdx[k++] = w * 32u + uint(b); m &= m - 1u; }
+    }
+  }
+  barrier();
+  uint cnt = min(sCount, MAXL);
+  if (li == 0u) {                                                  // 2 texels per tile: (near haze, z) (far haze, z)
+    bool hz = pc.par.w > 0.5;
+    imageStore(hazeImg, ivec2(tile.x * 2u, tile.y), vec4(hz ? sHaze[0] : vec3(0.0), zN));
+    imageStore(hazeImg, ivec2(tile.x * 2u + 1u, tile.y), vec4(hz ? sHazeF[0] : vec3(0.0), zF));
+  }
+  uint base = (tile.y * uint(pc.info.y) + tile.x) * (MAXL + 1u);
+  if (li == 0u) T[base] = cnt;
+  if (li < cnt) T[base + 1u + li] = sIdx[li];
+
+  if (pc.par.z > 0.5 && inside && (sp.x & 1) == 0 && (sp.y & 1) == 0) {   // heat map, debug image = half res
+    float heat = clamp(float(sCount) / 8.0, 0.0, 1.0);
+    vec3 c = sCount == 0u ? vec3(0.0) : mix(vec3(0.1, 0.25, 1.0), vec3(1.0, 0.25, 0.1), heat);
+    if (sCount >= MAXL) c = vec3(1.0);
+    c = c * 0.8 + (z > 0.0 ? 0.2 * fract(z / 10.0) : 0.0);       // faint depth bands
+    ivec2 g = sp % 16;
+    if (g.x == 0 || g.y == 0) c = mix(c, vec3(1.0, 1.0, 0.0), 0.3);
+    ivec2 op = sp / 2;
+    if (op.x < int(pc.size.x) && op.y < int(pc.size.y)) imageStore(outImg, op, vec4(c, 1.0));
+  }
+}

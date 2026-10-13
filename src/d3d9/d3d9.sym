@@ -22,6 +22,7 @@
     Direct3DCreate9On12Ex;
     NFSU_GetVersion;
     NFSU_CreateStorageTexture;
+    NFSU_ClusterLighting;
 
   local:
     *;
