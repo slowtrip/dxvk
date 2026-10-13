@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 /**
@@ -25,6 +26,20 @@ namespace dxvk::nfsu {
    * \brief Called when the application creates a D3D9 interface
    */
   void OnCreate(bool extended);
+
+  /**
+   * \brief Shader inventory
+   *
+   * Logs every shader the game creates, dumps its bytecode to
+   * nfsu_shaders/ and counts draws per shader pair. This takes a
+   * lock per draw, so it is only enabled when a file named
+   * nfsu_inventory.on exists next to the game executable.
+   */
+  extern bool g_inventory;
+
+  void OnShaderCreated(bool pixel, const void* object, const void* code, size_t length);
+
+  void OnDraw(const void* vs, const void* ps, uint32_t primitives);
 
   /**
    * \brief Called once per presented frame

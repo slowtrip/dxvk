@@ -3027,6 +3027,9 @@ namespace dxvk {
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
 
+    if (unlikely(nfsu::g_inventory))
+      nfsu::OnDraw(m_state.vertexShader.ptr(), m_state.pixelShader.ptr(), PrimitiveCount);
+
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
 
@@ -3078,6 +3081,9 @@ namespace dxvk {
           UINT             StartIndex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+
+    if (unlikely(nfsu::g_inventory))
+      nfsu::OnDraw(m_state.vertexShader.ptr(), m_state.pixelShader.ptr(), PrimitiveCount);
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -3140,6 +3146,9 @@ namespace dxvk {
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
 
+    if (unlikely(nfsu::g_inventory))
+      nfsu::OnDraw(m_state.vertexShader.ptr(), m_state.pixelShader.ptr(), PrimitiveCount);
+
     if (unlikely(!VertexStreamZeroStride))
       return D3DERR_INVALIDCALL;
 
@@ -3193,6 +3202,9 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+
+    if (unlikely(nfsu::g_inventory))
+      nfsu::OnDraw(m_state.vertexShader.ptr(), m_state.pixelShader.ptr(), PrimitiveCount);
 
     if (unlikely(!VertexStreamZeroStride))
       return D3DERR_INVALIDCALL;
@@ -3544,6 +3556,8 @@ namespace dxvk {
       module,
       pFunction,
       uint32_t(bytecodeLength)));
+
+    nfsu::OnShaderCreated(false, *ppShader, pFunction, bytecodeLength);
 
     return D3D_OK;
   }
@@ -3902,6 +3916,8 @@ namespace dxvk {
       module,
       pFunction,
       uint32_t(bytecodeLength)));
+
+    nfsu::OnShaderCreated(true, *ppShader, pFunction, bytecodeLength);
 
     return D3D_OK;
   }

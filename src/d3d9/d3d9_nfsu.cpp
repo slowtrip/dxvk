@@ -9,7 +9,9 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "../util/util_env.h"
 #include "../util/util_string.h"
@@ -70,6 +72,94 @@ namespace dxvk::nfsu {
 
     Log("%s loaded as the D3D9 renderer (Direct3DCreate9%s) for %s", g_version,
       extended ? "Ex" : "", env::getExePath().c_str());
+
+    g_inventory = std::ifstream(str::topath((GetExeDir() + "nfsu_inventory.on").c_str()).c_str()).is_open();
+
+    Log("shader inventory: %s", g_inventory
+      ? "on (nfsu_inventory.on found)"
+      : "off (create nfsu_inventory.on next to the executable to enable)");
+  }
+
+
+  static uint64_t Fnv1a(const void* data, size_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 0xcbf29ce484222325ull;
+
+    for (size_t i = 0; i < n; i++) {
+      h ^= p[i];
+      h *= 0x100000001b3ull;
+    }
+
+    return h;
+  }
+
+  struct PairStat {
+    uint64_t vs, ps;
+    uint64_t draws, prims;
+  };
+
+  bool g_inventory = false;
+
+  static std::mutex g_invMutex;
+  static std::unordered_map<const void*, uint64_t> g_hashOf;   // shader object -> bytecode hash
+  static std::unordered_map<uint64_t, PairStat>    g_window;   // per (vs, ps) pair, current window
+  static uint64_t g_frame = 0, g_windowStart = 0;
+
+
+  void OnShaderCreated(bool pixel, const void* object, const void* code, size_t length) {
+    if (!g_inventory || !code || length < sizeof(uint32_t))
+      return;
+
+    uint64_t hash = Fnv1a(code, length);
+    uint32_t version = *static_cast<const uint32_t*>(code);
+    bool fresh = true;
+
+    {
+      std::lock_guard<std::mutex> lock(g_invMutex);
+
+      for (const auto& e : g_hashOf) {
+        if (e.second == hash) {
+          fresh = false;
+          break;
+        }
+      }
+
+      g_hashOf[object] = hash;
+    }
+
+    const char* type = pixel ? "ps" : "vs";
+
+    Log("create %s %016llx %zu bytes %s_%u_%u obj=%p%s", type, (unsigned long long) hash, length,
+      type, (version >> 8) & 0xff, version & 0xff, object, fresh ? "" : " (same bytecode as an earlier shader)");
+
+    if (!fresh)
+      return;
+
+    std::string dir = GetExeDir() + "nfsu_shaders";
+    env::createDirectory(dir);
+
+    char name[64];
+    snprintf(name, sizeof(name), "/%s_%016llx.bin", type, (unsigned long long) hash);
+
+    std::ofstream file(str::topath((dir + name).c_str()).c_str(), std::ios_base::binary | std::ios_base::trunc);
+    file.write(static_cast<const char*>(code), length);
+  }
+
+
+  void OnDraw(const void* vs, const void* ps, uint32_t primitives) {
+    std::lock_guard<std::mutex> lock(g_invMutex);
+
+    auto hv = vs ? g_hashOf.find(vs) : g_hashOf.end();
+    auto hp = ps ? g_hashOf.find(ps) : g_hashOf.end();
+
+    uint64_t v = hv != g_hashOf.end() ? hv->second : 0;
+    uint64_t p = hp != g_hashOf.end() ? hp->second : 0;
+
+    PairStat& stat = g_window[v * 0x9e3779b97f4a7c15ull ^ p];
+    stat.vs = v;
+    stat.ps = p;
+    stat.draws += 1;
+    stat.prims += primitives;
   }
 
 
@@ -154,6 +244,47 @@ namespace dxvk::nfsu {
 
   void OnPresent() {
     FramePacing();
+
+    if (!g_inventory)
+      return;
+
+    std::vector<PairStat> rows;
+    uint64_t frames;
+
+    {
+      std::lock_guard<std::mutex> lock(g_invMutex);
+
+      if (++g_frame - g_windowStart < PacingWindow)
+        return;
+
+      frames = g_frame - g_windowStart;
+      g_windowStart = g_frame;
+
+      for (const auto& e : g_window)
+        rows.push_back(e.second);
+
+      g_window.clear();
+    }
+
+    std::sort(rows.begin(), rows.end(), [] (const PairStat& a, const PairStat& b) {
+      return a.draws > b.draws;
+    });
+
+    uint64_t draws = 0, prims = 0;
+
+    for (const auto& r : rows) {
+      draws += r.draws;
+      prims += r.prims;
+    }
+
+    Log("---- frames %llu..%llu: %zu shader pairs, %.1f draws/frame, %.0f prims/frame (vs 0 / ps 0 = fixed function)",
+      (unsigned long long) (g_frame - frames), (unsigned long long) g_frame, rows.size(),
+      double(draws) / frames, double(prims) / frames);
+
+    for (const auto& r : rows) {
+      Log("  vs %016llx ps %016llx  %8.1f draws/frame %9.0f prims/frame", (unsigned long long) r.vs,
+        (unsigned long long) r.ps, double(r.draws) / frames, double(r.prims) / frames);
+    }
   }
 
 }
