@@ -902,6 +902,7 @@ namespace dxvk {
       ENABLE_FEATURE(vk12, timelineSemaphore, true),
       ENABLE_FEATURE(vk12, uniformBufferStandardLayout, true),
       ENABLE_FEATURE(vk12, vulkanMemoryModel, true),
+      ENABLE_FEATURE(vk12, vulkanMemoryModelDeviceScope, false),
 
       ENABLE_FEATURE(vk13, inlineUniformBlock, true),
       ENABLE_FEATURE(vk13, computeFullSubgroups, true),
