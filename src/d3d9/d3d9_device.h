@@ -1059,6 +1059,17 @@ namespace dxvk {
       return m_multithread.acquire();
     }
 
+    /**
+     * \brief Creates a storage texture for NFSU compute passes
+     *
+     * The texture is an RGBA16F render target whose image
+     * can also be written by compute shaders.
+     */
+    HRESULT NfsuCreateStorageTexture(
+            UINT                    Width,
+            UINT                    Height,
+            IDirect3DTexture9**     ppTexture);
+
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
     }

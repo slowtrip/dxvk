@@ -1,5 +1,5 @@
 #include "d3d9_nfsu.h"
-#include "d3d9_include.h"
+#include "d3d9_device.h"
 
 #include <version.h>
 
@@ -291,10 +291,22 @@ namespace dxvk::nfsu {
 
 extern "C" {
 
-  // Interface for the game-side mod, which looks these up with GetProcAddress
+  using dxvk::D3D9DeviceEx;
+
+  // Interface for the game-side mod, which looks these up with GetProcAddress.
+  // pDevice must be the device object created by this DLL, not a wrapper.
 
   DLLEXPORT const char* __stdcall NFSU_GetVersion() {
     return dxvk::nfsu::g_version;
+  }
+
+  // Creates a render target texture (RGBA16F) that compute passes can write to
+  DLLEXPORT HRESULT __stdcall NFSU_CreateStorageTexture(IDirect3DDevice9* pDevice, UINT Width, UINT Height,
+                                                        IDirect3DTexture9** ppTexture) {
+    if (!pDevice)
+      return D3DERR_INVALIDCALL;
+
+    return static_cast<D3D9DeviceEx*>(pDevice)->NfsuCreateStorageTexture(Width, Height, ppTexture);
   }
 
 }

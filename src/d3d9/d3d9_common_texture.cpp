@@ -425,6 +425,12 @@ namespace dxvk {
       imageInfo.shared = true;
     }
 
+    // Storage textures are written by the NFSU compute passes
+    if (m_desc.ImageUsage & VK_IMAGE_USAGE_STORAGE_BIT) {
+      imageInfo.stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      imageInfo.access |= VK_ACCESS_SHADER_WRITE_BIT;
+    }
+
     DecodeMultiSampleType(m_desc.MultiSample, m_desc.MultisampleQuality, &imageInfo.sampleCount);
 
     // The image must be marked as mutable if it can be reinterpreted
