@@ -1087,6 +1087,22 @@ namespace dxvk {
       const float*                  pLights,
             UINT                    LightCount);
 
+    /**
+     * \brief Runs the NFSU froxel fog passes
+     *
+     * Fills a froxel volume with fog density and in-scattered lamp
+     * light, then resolves it into a screen-space texture. The
+     * parameter layout is documented in d3d9_nfsu_compute.cpp.
+     */
+    HRESULT NfsuFog(
+            IDirect3DBaseTexture9*  pDepth,
+            IDirect3DBaseTexture9*  pOut,
+            IDirect3DBaseTexture9* const* pShadowMaps,
+            IDirect3DBaseTexture9*  pAtlas,
+      const float*                  pParams,
+      const float*                  pLights,
+            UINT                    LightCount);
+
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
     }
@@ -1615,6 +1631,20 @@ namespace dxvk {
     Rc<DxvkBuffer>                  m_nfsuTiles;
     uint32_t                        m_nfsuTileCount    = 0u;
     bool                            m_nfsuLogged       = false;
+
+    // NFSU froxel fog, created on first use
+    const DxvkPipelineLayout*       m_nfsuFogLayout    = nullptr;
+    VkPipeline                      m_nfsuFogPipe      = VK_NULL_HANDLE;
+    const DxvkPipelineLayout*       m_nfsuFogResLayout = nullptr;
+    VkPipeline                      m_nfsuFogResPipe   = VK_NULL_HANDLE;
+    Rc<DxvkBuffer>                  m_nfsuFogLights;
+    Rc<DxvkBuffer>                  m_nfsuFogParams;
+    Rc<DxvkImage>                   m_nfsuFogVol;
+    Rc<DxvkImageView>               m_nfsuFogVolView;
+    Rc<DxvkImage>                   m_nfsuFogInj[2];
+    Rc<DxvkImageView>               m_nfsuFogInjView[2];
+    uint32_t                        m_nfsuFogFrame     = 0u;
+    bool                            m_nfsuFogLogged    = false;
 
     void NfsuDestroy();
 

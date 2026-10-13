@@ -1,0 +1,226 @@
+#version 450
+// NFSU froxel fog, pass 1: one 64-thread workgroup per 16 px screen tile, thread = depth slice (64 exponential
+// slices, near .. MaxDistance). Lights (view space, nearest first) are culled against the tile's frustum slab,
+// every froxel gets a density (height fog + drifting noise + floodlight mist) and in-scatter (window / spot /
+// falloff), with shadow map visibility for the mapped lamps (shadowed beams), then
+// thread 0 integrates the column front to back. Output (3D, rgba16f): rgb = in-scatter accumulated to the END of
+// slice i, a = optical depth to the end of slice i.
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 64) in;
+
+struct Light { vec4 posRange; vec4 colR0; vec4 dirCos; vec4 extra; };   // extra: cosInner, noFog, fogGain, shadowSlot
+layout(std430, set = 0, binding = 0) readonly buffer Lights { Light L[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Params { vec4 P[60]; };   // [24..39] lamp 2..5 VP rows, [40] their map flags
+// atlas lamps: [42..57] per tile: baked lamp position xyz (world), w = weight (rank fade, 0 = tile unused);
+// [58] x 1/tan(fov/2), y near, z far - near, w tiles per row; [59] x tile size (px)
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D volImg;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image3D injImg;     // this frame's (temporally blended) froxels
+layout(set = 0, binding = 8, rgba16f) uniform readonly image3D prevImg;     // last frame's, reprojected
+layout(set = 0, binding = 3) uniform texture2D lsSt0;
+layout(set = 0, binding = 4) uniform texture2D lsCar0;
+layout(set = 0, binding = 5) uniform texture2D lsSt1;
+layout(set = 0, binding = 6) uniform texture2D lsCar1;
+layout(set = 0, binding = 9)  uniform texture2D lsSt2;
+layout(set = 0, binding = 10) uniform texture2D lsCar2;
+layout(set = 0, binding = 11) uniform texture2D lsSt3;
+layout(set = 0, binding = 12) uniform texture2D lsCar3;
+layout(set = 0, binding = 13) uniform texture2D lsSt4;
+layout(set = 0, binding = 14) uniform texture2D lsCar4;
+layout(set = 0, binding = 15) uniform texture2D lsSt5;
+layout(set = 0, binding = 16) uniform texture2D lsCar5;
+layout(set = 0, binding = 17) uniform texture2D lsAtlas;   // baked STATIC shadow maps of up to 16 more lamps (L16 linear depth codes)
+
+layout(push_constant) uniform PC {
+  vec4 info;  // x light count, y tiles x, z tiles y, w slices
+  vec4 size;  // xy screen size, z near (m), w point-light fog weight
+  vec4 jit;   // xy sample offset inside the tile (px), z offset inside the slice (0..1), w history valid (1)
+} pc;
+
+// P[0] proj P00 P11 P22 P32 | P[1..3] inverse view rows 0..2 (xyz), P[4] camera position (xyz)
+// P[5] mist: density, height (m), max distance (m), time (s) | P[6] mist2: noise scale, drift, ground offset, strength
+// P[7] falloff r0, lamp-map on 0, on 1, - | P[8..11] lamp 0 map VP rows | P[12..15] lamp 1 map VP rows
+// P[16] lsPar: P22, P32, bias, texel size | P[17] history blend (weight of this frame), - | P[18..21] last frame's
+// world -> view (M rows 0..3, xyz) | P[22] last frame's proj P00 P11 P22 P32
+const uint S = 64u;
+shared uint sMask[8];
+shared uint sIdx[64];
+shared uint sCnt;
+shared vec3 sSc[S];
+shared float sDens[S];
+shared float sDt[S];
+
+float noise3(vec3 p) {
+  float a = sin(p.x * 1.7 + sin(p.y * 0.9 + p.z * 0.3) * 1.3);
+  float b = sin(p.y * 1.3 + sin(p.z * 1.1 + p.x * 0.5) * 1.7);
+  float c = sin(p.z * 1.9 + sin(p.x * 0.7 + p.y * 0.6) * 1.1);
+  return 0.5 + 0.1666 * (a + b + c);
+}
+
+ivec2 lsSize(int slot) {
+  if (slot == 0) return textureSize(lsSt0, 0);
+  if (slot == 1) return textureSize(lsSt1, 0);
+  if (slot == 2) return textureSize(lsSt2, 0);
+  if (slot == 3) return textureSize(lsSt3, 0);
+  if (slot == 4) return textureSize(lsSt4, 0);
+  return textureSize(lsSt5, 0);
+}
+
+float lsDepth(int slot, ivec2 q) {                                 // min(static world, cars) at texel q
+  if (slot == 0) return min(texelFetch(lsSt0, q, 0).r, texelFetch(lsCar0, q, 0).r);
+  if (slot == 1) return min(texelFetch(lsSt1, q, 0).r, texelFetch(lsCar1, q, 0).r);
+  if (slot == 2) return min(texelFetch(lsSt2, q, 0).r, texelFetch(lsCar2, q, 0).r);
+  if (slot == 3) return min(texelFetch(lsSt3, q, 0).r, texelFetch(lsCar3, q, 0).r);
+  if (slot == 4) return min(texelFetch(lsSt4, q, 0).r, texelFetch(lsCar4, q, 0).r);
+  return min(texelFetch(lsSt5, q, 0).r, texelFetch(lsCar5, q, 0).r);
+}
+
+float lsOn(int slot) {                                              // map weight 0..1 (rank fade), 0 = no map
+  if (slot == 0) return P[7].y;
+  if (slot == 1) return P[7].z;
+  return slot >= 2 && slot <= 5 ? P[40][slot - 2] : 0.0;
+}
+
+float lsVis(vec3 w, int slot) {                                    // 1 = the lamp sees this point
+  int b = slot < 2 ? 8 + slot * 4 : 24 + (slot - 2) * 4;           // VP rows: slots 0/1 at P[8]/P[12], 2..5 at P[24..]
+  vec4 c = w.x * P[b] + w.y * P[b + 1] + w.z * P[b + 2] + P[b + 3];
+  if (c.w < 0.3) return 1.0;
+  vec2 su = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+  if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) return 1.0;
+  ivec2 sz = lsSize(slot);                                         // each slot its own map size
+  ivec2 q = clamp(ivec2(su * vec2(sz)), ivec2(0), sz - 1);
+  float zo = P[16].y / (lsDepth(slot, q) - P[16].x);
+  return zo < c.w - P[16].z ? 0.0 : 1.0;
+}
+
+// atlas lamp t (straight-down street lamp, perspective projection with near and far): view x = -(w.x - L.x),
+// y = w.y - L.y, depth zv = L.z - w.z; map value = linear depth code (65535 = nothing). Static world only (no car maps).
+float lsVisAtlas(vec3 w, int t) {
+  vec3 L = P[42 + t].xyz;
+  float zv = L.z - w.z;
+  if (zv < P[58].y) return 1.0;
+  float ys = P[58].x;
+  vec2 su = vec2(ys * -(w.x - L.x) / zv * 0.5 + 0.5, 0.5 - ys * (w.y - L.y) / zv * 0.5);
+  if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) return 1.0;
+  int ts = int(P[59].x), tr = int(P[58].w);
+  ivec2 q = clamp(ivec2(su * float(ts)), ivec2(0), ivec2(ts - 1)) + ivec2(t % tr, t / tr) * ts;
+  float code = texelFetch(lsAtlas, q, 0).r * 65535.0;
+  if (code > 65534.5) return 1.0;
+  float zm = P[58].y + code * (P[58].z / 65534.0);
+  return zm < zv - P[16].z ? 0.0 : 1.0;
+}
+
+void main() {
+  uint li = gl_LocalInvocationIndex;
+  uvec2 tile = gl_WorkGroupID.xy;
+  if (li < 8u) sMask[li] = 0u;
+  barrier();
+
+  float zn = pc.size.z, zf = P[5].z;
+  // tile frustum slab (view space: x right, y up, z forward) from zn to zf
+  vec2 t0 = vec2(tile * 16u) / pc.size.xy, t1 = vec2(tile * 16u + 16u) / pc.size.xy;
+  vec2 s0 = vec2(t0.x * 2.0 - 1.0, 1.0 - t1.y * 2.0) / P[0].xy;
+  vec2 s1 = vec2(t1.x * 2.0 - 1.0, 1.0 - t0.y * 2.0) / P[0].xy;
+  vec2 lo = min(min(s0 * zn, s0 * zf), min(s1 * zn, s1 * zf)), hi = max(max(s0 * zn, s0 * zf), max(s1 * zn, s1 * zf));
+  vec3 bmin = vec3(lo, zn), bmax = vec3(hi, zf);                   // robust to the sign of P11
+  uint n = uint(pc.info.x);
+  for (uint i = li; i < n; i += 64u) {
+    Light Li = L[i];
+    if (Li.extra.y > 0.5) continue;                                // ceiling fixtures: no mist (milky tunnels)
+    vec3 q = clamp(Li.posRange.xyz, bmin, bmax) - Li.posRange.xyz;
+    if (dot(q, q) < Li.posRange.w * Li.posRange.w) atomicOr(sMask[i >> 5u], 1u << (i & 31u));
+  }
+  barrier();
+  if (li == 0u) {                                                  // compact in light order (nearest first): stable
+    uint k = 0u;
+    for (uint w = 0u; w < 8u && k < 64u; w++) {
+      uint m = sMask[w];
+      while (m != 0u && k < 64u) { int b = findLSB(m); sIdx[k++] = w * 32u + uint(b); m &= m - 1u; }
+    }
+    sCnt = k;
+  }
+  barrier();
+
+  // this thread's froxel: slice li of the tile-centre ray
+  vec2 tc = (vec2(tile * 16u) + 8.0 + pc.jit.xy) / pc.size.xy;    // jittered inside the tile (temporal smoothing)
+  vec3 rv = vec3((tc.x * 2.0 - 1.0) / P[0].x, (1.0 - tc.y * 2.0) / P[0].y, 1.0);   // view ray, z = 1
+  float ratio = zf / zn;
+  float za = zn * pow(ratio, float(li) / float(S)), zb = zn * pow(ratio, float(li + 1u) / float(S));
+  float zc = mix(za, zb, pc.jit.z);                                // jittered inside the slice
+  vec3 pv = rv * zc;                                               // view-space froxel centre
+  vec3 pw = pv.x * P[1].xyz + pv.y * P[2].xyz + pv.z * P[3].xyz + P[4].xyz;
+  float dt = (zb - za) * length(rv);                               // metres along the ray
+
+  float ground = P[4].z - P[6].z;
+  vec3 wind = vec3(0.8, 0.35, 0.05) * P[6].y * P[5].w;
+  float h = max(pw.z - ground, 0.0);
+  float dens = P[5].x * exp(-h / P[5].y) * (0.35 + 1.3 * noise3((pw + wind) * P[6].x));
+  vec3 sc = vec3(0.0);
+  float fog = 0.0;
+  uint cnt = sCnt;
+  for (uint k = 0u; k < cnt; k++) {
+    Light Li = L[sIdx[k]];
+    vec3 Lv = Li.posRange.xyz - pv;
+    float d2 = dot(Lv, Lv);
+    float r2 = Li.posRange.w * Li.posRange.w;
+    fog += Li.extra.z * clamp(1.0 - d2 / 400.0, 0.0, 1.0);       // within 20 m of a floodlight
+    if (d2 >= r2) continue;
+    float dist = sqrt(d2);
+    float win = clamp(1.0 - d2 * d2 / (r2 * r2), 0.0, 1.0);
+    float spot = smoothstep(Li.dirCos.w, Li.extra.x, dot(-Lv / max(dist, 0.001), Li.dirCos.xyz));
+    float vis = 1.0;
+    if (Li.extra.w > 5.5) {                                        // atlas lamp: beams cut by its baked static map
+      int t = int(Li.extra.w - 6.0 + 0.5);
+      float tw = t < 16 ? P[42 + t].w : 0.0;
+      if (tw > 0.0) vis = mix(1.0, lsVisAtlas(pw, t), clamp(tw, 0.0, 1.0));
+    } else if (Li.extra.w > -0.5) {                                // shadow-mapped lamp: beams cut by the world
+      int slot = int(Li.extra.w + 0.5);
+      float lw = lsOn(slot);
+      if (lw > 0.0) vis = mix(1.0, lsVis(pw, slot), clamp(lw, 0.0, 1.0));
+    }
+    float wgt = Li.dirCos.w < -1.5 ? pc.size.w : 1.0;              // omni point lights (lanterns): fog weight
+    sc += Li.colR0.rgb * (wgt * (1.0 + Li.extra.z) * win * win * spot * vis / (1.0 + d2 / (Li.colR0.w * Li.colR0.w)));
+  }
+  if (fog > 0.0) dens += P[5].x * fog * 0.5 * (0.35 + 1.3 * noise3((pw - wind) * P[6].x * 1.7));
+  vec3 scat = vec3(1.0) - exp(-sc);                                // lamps saturate softly
+  // temporal: blend with last frame's froxel at this point's position in last frame's grid (reprojection),
+  // trilinear over the coarse grid; outside the old view / first frame -> this frame only
+  if (pc.jit.w > 0.5) {
+    vec3 q = pw.x * P[18].xyz + pw.y * P[19].xyz + pw.z * P[20].xyz + P[21].xyz;   // last frame's view space
+    if (q.z > zn) {
+      vec2 nd = q.xy * P[22].xy / q.z;
+      vec3 g = vec3((nd.x * 0.5 + 0.5) * pc.size.x / 16.0 - 0.5, (0.5 - nd.y * 0.5) * pc.size.y / 16.0 - 0.5,
+                    log(q.z / zn) / log(ratio) * float(S) - 0.5);
+      vec3 gmax = vec3(pc.info.y - 1.0, pc.info.z - 1.0, float(S) - 1.0);
+      if (all(greaterThanEqual(g, vec3(-0.5))) && all(lessThanEqual(g, gmax + 0.5))) {
+        g = clamp(g, vec3(0.0), gmax);
+        ivec3 b = ivec3(floor(g));
+        ivec3 b1 = min(b + 1, ivec3(gmax));
+        vec3 f = g - vec3(b);
+        vec4 h = mix(mix(mix(imageLoad(prevImg, ivec3(b.x, b.y, b.z)), imageLoad(prevImg, ivec3(b1.x, b.y, b.z)), f.x),
+                         mix(imageLoad(prevImg, ivec3(b.x, b1.y, b.z)), imageLoad(prevImg, ivec3(b1.x, b1.y, b.z)), f.x), f.y),
+                     mix(mix(imageLoad(prevImg, ivec3(b.x, b.y, b1.z)), imageLoad(prevImg, ivec3(b1.x, b.y, b1.z)), f.x),
+                         mix(imageLoad(prevImg, ivec3(b.x, b1.y, b1.z)), imageLoad(prevImg, ivec3(b1.x, b1.y, b1.z)), f.x), f.y), f.z);
+        scat = mix(h.rgb, scat, P[17].x);
+        dens = mix(h.a, dens, P[17].x);
+      }
+    }
+  }
+  imageStore(injImg, ivec3(tile, li), vec4(scat, dens));
+  sSc[li] = scat;
+  sDens[li] = dens;
+  sDt[li] = dt;
+  barrier();
+
+  if (li == 0u) {                                                  // front-to-back integration of the column
+    vec3 acc = vec3(0.0);
+    float od = 0.0;
+    for (uint s = 0u; s < S; s++) {
+      acc += sDens[s] * sSc[s] * exp(-od) * sDt[s];
+      od += sDens[s] * sDt[s];
+      sSc[s] = acc;                                                // reuse: accumulated to the end of slice s
+      sDens[s] = od;
+    }
+  }
+  barrier();
+  imageStore(volImg, ivec3(tile, li), vec4(sSc[li], sDens[li]));
+}

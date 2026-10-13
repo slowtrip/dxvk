@@ -1,0 +1,44 @@
+#version 450
+// NFSU froxel fog, pass 2: resolve the integrated volume at every mist-texture pixel's depth (bilinear over the 4
+// nearest tiles, linear between slice boundaries):
+// rgb = (1 - exp(-acc * strength * 3)) * 0.6 (glow), a = exp(-optical depth) (transmittance).
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D outImg;
+layout(set = 0, binding = 1) uniform texture2D depthTex;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image3D volImg;
+
+layout(push_constant) uniform PC {
+  vec4 proj;  // P00 P11 P22 P32
+  vec4 size;  // xy out size, zw screen size
+  vec4 fog;   // x near (m), y max distance (m), z slices, w strength
+  vec4 tiles; // xy tiles
+} pc;
+
+vec4 colAt(ivec2 t, float u) {                                     // integrated value at slice-boundary coordinate u
+  float S = pc.fog.z;
+  if (u <= 0.0) return vec4(0.0);
+  if (u >= S) return imageLoad(volImg, ivec3(t, int(S) - 1));
+  float f = floor(u);
+  vec4 b = imageLoad(volImg, ivec3(t, int(f)));                   // end of slice f = boundary f+1
+  vec4 a = f >= 1.0 ? imageLoad(volImg, ivec3(t, int(f) - 1)) : vec4(0.0);
+  return mix(a, b, u - f);
+}
+
+void main() {
+  ivec2 op = ivec2(gl_GlobalInvocationID.xy);
+  if (op.x >= int(pc.size.x) || op.y >= int(pc.size.y)) return;
+  vec2 sp = (vec2(op) + 0.5) * pc.size.zw / pc.size.xy;            // full-res position of this pixel
+  float d = texelFetch(depthTex, clamp(ivec2(sp), ivec2(0), ivec2(pc.size.zw) - 1), 0).r;
+  float z = d >= 0.99999 ? 1e4 : pc.proj.w / (d - pc.proj.z);
+  float u = log(max(z, 1e-3) / pc.fog.x) / log(pc.fog.y / pc.fog.x) * pc.fog.z;   // continuous slice boundary
+  vec2 tp = sp / 16.0 - 0.5, tb = floor(tp), tf = tp - tb;
+  ivec2 tmax = ivec2(pc.tiles.xy) - 1;
+  vec4 v00 = colAt(clamp(ivec2(tb), ivec2(0), tmax), u);
+  vec4 v10 = colAt(clamp(ivec2(tb) + ivec2(1, 0), ivec2(0), tmax), u);
+  vec4 v01 = colAt(clamp(ivec2(tb) + ivec2(0, 1), ivec2(0), tmax), u);
+  vec4 v11 = colAt(clamp(ivec2(tb) + ivec2(1, 1), ivec2(0), tmax), u);
+  vec4 v = mix(mix(v00, v10, tf.x), mix(v01, v11, tf.x), tf.y);
+  imageStore(outImg, op, vec4((vec3(1.0) - exp(-v.rgb * pc.fog.w * 3.0)) * 0.6, exp(-v.a)));
+}

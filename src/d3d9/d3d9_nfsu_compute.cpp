@@ -11,6 +11,8 @@
 
 #include <nfsu_cluster.h>
 #include <nfsu_light.h>
+#include <nfsu_fog.h>
+#include <nfsu_fogres.h>
 
 namespace dxvk {
 
@@ -292,10 +294,264 @@ namespace dxvk {
   }
 
 
+  // Froxel fog. Every 16x16 pixel tile gets a column of 64 exponential depth slices. The first pass culls
+  // lights per tile, fills each froxel with fog density and in-scattered light, blends it with the
+  // reprojected result of the previous frame and integrates the column front to back. The second pass
+  // resolves the volume into pOut at each pixel's depth: rgb glow, a transmittance.
+  //
+  // pDepth       INTZ scene depth
+  // pOut         storage texture receiving the resolved fog
+  // pShadowMaps  12 INTZ shadow maps, static and dynamic geometry for each of six lamps, may be null
+  // pAtlas       optional L16 atlas of baked shadow maps for up to 16 more lamps
+  // pLights      as in NfsuCluster, with extra = cosInner noFog fogGain shadowSlot
+  // pParams      240 floats, as vec4 P[60] in nfsu_fog.comp:
+  //    P[0]       projection P00 P11 P22 P32
+  //    P[1..3]    inverse view matrix rows
+  //    P[4]       camera position
+  //    P[5]       fog density, height (m), max distance (m), time (s)
+  //    P[6]       noise scale, drift, ground offset, strength
+  //    P[7]       falloff, shadow map 0 on, shadow map 1 on
+  //    P[8..15]   view projection rows of shadow maps 0 and 1
+  //    P[16]      shadow map P22, P32, bias, texel size
+  //    P[17]      weight of the new frame in the history blend
+  //    P[18..21]  world to view matrix rows of the previous frame
+  //    P[22]      projection of the previous frame
+  //    P[23]      near slice distance (m), point light fog weight, previous frame valid
+  //    P[24..39]  view projection rows of shadow maps 2 to 5
+  //    P[40]      shadow maps 2 to 5 on
+  //    P[42..57]  atlas tiles: lamp position (world), weight
+  //    P[58]      atlas 1 / tan(fov / 2), near, far - near, tiles per row
+  //    P[59]      atlas tile size (px)
+  HRESULT D3D9DeviceEx::NfsuFog(
+          IDirect3DBaseTexture9*  pDepth,
+          IDirect3DBaseTexture9*  pOut,
+          IDirect3DBaseTexture9* const* pLs,
+          IDirect3DBaseTexture9*  pAtlas,
+    const float*                  pParams,
+    const float*                  pLights,
+          UINT                    LightCount) {
+    D3D9DeviceLock lock = LockDevice();
+    D3D9CommonTexture* out   = pOut ? GetCommonTexture(pOut) : nullptr;
+    D3D9CommonTexture* atlas = pAtlas ? GetCommonTexture(pAtlas) : nullptr;
+    D3D9CommonTexture* depth = pDepth ? GetCommonTexture(pDepth) : nullptr;
+    if (!pParams || !pLs || !depth || !out || !(out->Desc()->ImageUsage & VK_IMAGE_USAGE_STORAGE_BIT))
+      return D3DERR_INVALIDCALL;
+    constexpr uint32_t Slices = 64u;
+    constexpr uint32_t LsCount = 12u;
+    constexpr uint32_t ParamCount = 240u;
+
+    if (!m_nfsuFogLayout) {
+      static const std::array<DxvkDescriptorSetLayoutBinding, 18> fb = {{
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },   // shadow map atlas
+      }};
+      m_nfsuFogLayout = m_dxvkDevice->createBuiltInPipelineLayout(0u, VK_SHADER_STAGE_COMPUTE_BIT, 12 * sizeof(float), fb.size(), fb.data());
+      util::DxvkBuiltInShaderStage st;
+      st.size = sizeof(nfsu_fog); st.code = nfsu_fog; st.spec = nullptr;
+      m_nfsuFogPipe = m_dxvkDevice->createBuiltInComputePipeline(m_nfsuFogLayout, st);
+      static const std::array<DxvkDescriptorSetLayoutBinding, 3> rb = {{
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      }};
+      m_nfsuFogResLayout = m_dxvkDevice->createBuiltInPipelineLayout(0u, VK_SHADER_STAGE_COMPUTE_BIT, 16 * sizeof(float), rb.size(), rb.data());
+      st.size = sizeof(nfsu_fogres); st.code = nfsu_fogres;
+      m_nfsuFogResPipe = m_dxvkDevice->createBuiltInComputePipeline(m_nfsuFogResLayout, st);
+      nfsu::Log("compute: fog pipeline %s, fog resolve pipeline %s", m_nfsuFogPipe ? "created" : "FAILED", m_nfsuFogResPipe ? "created" : "FAILED");
+    }
+    if (!m_nfsuFogPipe || !m_nfsuFogResPipe)
+      return D3DERR_INVALIDCALL;
+
+    Rc<DxvkImage> depthImage = depth->GetImage();
+    Rc<DxvkImage> outImage   = out->GetImage();
+    uint32_t sw = depthImage->info().extent.width, sh = depthImage->info().extent.height;
+    uint32_t tx = (sw + 15u) / 16u, ty = (sh + 15u) / 16u;
+    uint32_t ow = outImage->info().extent.width, oh = outImage->info().extent.height;
+
+    bool volInit = false;
+    if (m_nfsuFogVol == nullptr || m_nfsuFogVol->info().extent.width != tx || m_nfsuFogVol->info().extent.height != ty) {
+      DxvkImageCreateInfo ii;
+      ii.type        = VK_IMAGE_TYPE_3D;
+      ii.format      = VK_FORMAT_R16G16B16A16_SFLOAT;
+      ii.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      ii.extent      = { tx, ty, Slices };
+      ii.numLayers   = 1u;
+      ii.mipLevels   = 1u;
+      ii.usage       = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;   // cleared by initImage
+      ii.stages      = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+      ii.access      = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      ii.tiling      = VK_IMAGE_TILING_OPTIMAL;
+      ii.layout      = VK_IMAGE_LAYOUT_GENERAL;
+      ii.debugName   = "NFSU fog volume";
+      m_nfsuFogVol = m_dxvkDevice->createImage(ii, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      ii.debugName = "NFSU fog history";
+      for (int i = 0; i < 2; i++) m_nfsuFogInj[i] = m_dxvkDevice->createImage(ii, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      DxvkImageViewKey k;
+      k.viewType = VK_IMAGE_VIEW_TYPE_3D;
+      k.format   = ii.format;
+      k.usage    = VK_IMAGE_USAGE_STORAGE_BIT;
+      k.layout   = VK_IMAGE_LAYOUT_GENERAL;
+      k.aspects  = VK_IMAGE_ASPECT_COLOR_BIT;
+      k.mipIndex = 0; k.mipCount = 1; k.layerIndex = 0; k.layerCount = 1;
+      m_nfsuFogVolView = m_nfsuFogVol->createView(k);
+      for (int i = 0; i < 2; i++) m_nfsuFogInjView[i] = m_nfsuFogInj[i]->createView(k);
+      m_nfsuFogFrame = 0;
+      volInit = true;
+      nfsu::Log("compute: fog volume %ux%ux%u", tx, ty, Slices);
+    }
+    for (Rc<DxvkBuffer>* b : { &m_nfsuFogLights, &m_nfsuFogParams }) {
+      if (*b != nullptr) continue;
+      DxvkBufferCreateInfo bi;
+      bi.size   = (b == &m_nfsuFogLights ? NfsuMaxLights * 16u : ParamCount) * sizeof(float);
+      bi.usage  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      bi.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      bi.access = VK_ACCESS_SHADER_READ_BIT;
+      bi.debugName = b == &m_nfsuFogLights ? "NFSU fog lights" : "NFSU fog params";
+      *b = m_dxvkDevice->createBuffer(bi, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    uint32_t nl = std::min<uint32_t>(pLights ? LightCount : 0u, NfsuMaxLights);
+    Rc<DxvkResourceAllocation> lightSlice = m_nfsuFogLights->allocateStorage();
+    if (nl)
+      std::memcpy(lightSlice->mapPtr(), pLights, nl * 16u * sizeof(float));
+    Rc<DxvkResourceAllocation> parSlice = m_nfsuFogParams->allocateStorage();
+    std::memcpy(parSlice->mapPtr(), pParams, ParamCount * sizeof(float));
+
+    // shadow maps: a missing map is replaced by the scene depth, its flag in the parameters is 0 so it is never read
+    std::array<Rc<DxvkImage>, LsCount> ls;
+    for (uint32_t i = 0; i < LsCount; i++) {
+      D3D9CommonTexture* c = pLs[i] ? GetCommonTexture(pLs[i]) : nullptr;
+      ls[i] = c ? c->GetImage() : depthImage;
+    }
+    Rc<DxvkImage> atlasImage = atlas ? atlas->GetImage() : nullptr;
+
+    // temporal: R2 sequence inside the tile (px) and slice (0..1); history only when the images are not new
+    // and the caller says last frame's matrices are valid
+    uint32_t fi = m_nfsuFogFrame++;
+    float jx = std::fmod(0.5f + 0.7548777f * float(fi), 1.0f), jy = std::fmod(0.5f + 0.5698403f * float(fi), 1.0f);
+    float jz = std::fmod(0.5f + 0.6180340f * float(fi), 1.0f);
+    bool hist = !volInit && fi > 0u && pParams[94] > 0.5f;
+    std::array<float, 12> fpc = { float(nl), float(tx), float(ty), float(Slices), float(sw), float(sh), pParams[92], pParams[93],
+                                  (jx - 0.5f) * 16.0f, (jy - 0.5f) * 16.0f, jz, hist ? 1.0f : 0.0f };
+    Rc<DxvkImage> injCur = m_nfsuFogInj[fi & 1u], injPrev = m_nfsuFogInj[(fi + 1u) & 1u];
+    Rc<DxvkImageView> injCurView = m_nfsuFogInjView[fi & 1u], injPrevView = m_nfsuFogInjView[(fi + 1u) & 1u];
+    std::array<float, 16> rpc = { pParams[0], pParams[1], pParams[2], pParams[3],
+                                  float(ow), float(oh), float(sw), float(sh),
+                                  pParams[92], pParams[22], float(Slices), pParams[27],
+                                  float(tx), float(ty), 0.0f, 0.0f };
+    if (!m_nfsuFogLogged) {
+      m_nfsuFogLogged = true;
+      int nm = 0;
+      for (uint32_t i = 0; i < LsCount; i += 2u) nm += pLs[i] != nullptr;
+      nfsu::Log("compute: first fog dispatch: %u lights, %ux%u tiles x %u slices, out %ux%u, near %.2f max %.1f m, %d of %u shadow maps",
+        nl, tx, ty, Slices, ow, oh, pParams[92], pParams[22], nm, LsCount / 2u);
+    }
+
+    EmitCs([
+      cDepth = std::move(depthImage), cOut = std::move(outImage), cLs = ls, cAtlas = std::move(atlasImage),
+      cVol = m_nfsuFogVol, cVolView = m_nfsuFogVolView, cInj = std::move(injCur), cInjView = std::move(injCurView),
+      cPrev = std::move(injPrev), cPrevView = std::move(injPrevView),
+      cLights = m_nfsuFogLights, cLSlice = std::move(lightSlice), cPar = m_nfsuFogParams, cPSlice = std::move(parSlice),
+      cFLayout = m_nfsuFogLayout, cFPipe = m_nfsuFogPipe, cRLayout = m_nfsuFogResLayout, cRPipe = m_nfsuFogResPipe,
+      cFpc = fpc, cRpc = rpc, cTiles = VkExtent2D { tx, ty }, cOutSize = VkExtent2D { ow, oh }, cVolInit = volInit
+    ] (DxvkContext* ctx) mutable {
+      if (cVolInit) {
+        ctx->initImage(cVol, VK_IMAGE_LAYOUT_UNDEFINED);
+        ctx->initImage(cInj, VK_IMAGE_LAYOUT_UNDEFINED);
+        ctx->initImage(cPrev, VK_IMAGE_LAYOUT_UNDEFINED);
+      }
+      ctx->invalidateBuffer(cLights, std::move(cLSlice));
+      ctx->invalidateBuffer(cPar, std::move(cPSlice));
+      Rc<DxvkCommandList> cmd = ctx->beginExternalRendering();
+
+      Rc<DxvkImageView> outView   = cOut->createView(NfsuViewKey(cOut, VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_ASPECT_COLOR_BIT));
+      Rc<DxvkImageView> depthView = cDepth->createView(NfsuViewKey(cDepth, VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT));
+      std::array<Rc<DxvkImageView>, 12> lsView;
+      for (uint32_t i = 0; i < lsView.size(); i++)
+        lsView[i] = cLs[i]->createView(NfsuViewKey(cLs[i], VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT));
+      Rc<DxvkImageView> atlasView = cAtlas != nullptr ? cAtlas->createView(NfsuViewKey(cAtlas, VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
+                                                      : lsView[0];   // no atlas: any valid image, never read
+
+      VkPipelineStageFlags2 imgStages = 0; VkAccessFlags2 imgAccess = 0;
+      for (const Rc<DxvkImage>* i : { &cDepth, &cOut })
+        { imgStages |= (*i)->info().stages; imgAccess |= (*i)->info().access; }
+      for (const Rc<DxvkImage>& i : cLs)
+        { imgStages |= i->info().stages; imgAccess |= i->info().access; }
+      if (cAtlas != nullptr) { imgStages |= cAtlas->info().stages; imgAccess |= cAtlas->info().access; }
+      auto barrier = [&](VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da) {
+        VkMemoryBarrier2 b = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        b.srcStageMask = ss; b.srcAccessMask = sa; b.dstStageMask = ds; b.dstAccessMask = da;
+        VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        dep.memoryBarrierCount = 1u; dep.pMemoryBarriers = &b;
+        cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &dep);
+      };
+      const VkPipelineStageFlags2 CS = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      const VkAccessFlags2 RW = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+
+      // before: depth + shadow maps just written as attachments, out sampled last frame, buffers written by
+      // the host, the volume read by last frame's resolve
+      barrier(imgStages | CS | VK_PIPELINE_STAGE_2_HOST_BIT, imgAccess | RW | VK_ACCESS_2_HOST_WRITE_BIT, CS, RW);
+
+      std::array<DxvkDescriptorWrite, 18> fd = { };
+      fd[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; fd[0].buffer = cLights->getSliceInfo();
+      fd[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; fd[1].buffer = cPar->getSliceInfo();
+      fd[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  fd[2].descriptor = cVolView->getDescriptor();
+      for (int i = 0; i < 4; i++) { fd[3 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; fd[3 + i].descriptor = lsView[i]->getDescriptor(); }
+      fd[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  fd[7].descriptor = cInjView->getDescriptor();
+      fd[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  fd[8].descriptor = cPrevView->getDescriptor();
+      for (int i = 0; i < 8; i++) { fd[9 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; fd[9 + i].descriptor = lsView[4 + i]->getDescriptor(); }
+      fd[17].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; fd[17].descriptor = atlasView->getDescriptor();
+      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cFPipe);
+      cmd->bindResources(DxvkCmdBuffer::ExecBuffer, cFLayout, fd.size(), fd.data(), sizeof(cFpc), cFpc.data());
+      cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer, cTiles.width, cTiles.height, 1u);
+
+      barrier(CS, VK_ACCESS_2_SHADER_WRITE_BIT, CS, VK_ACCESS_2_SHADER_READ_BIT);
+
+      std::array<DxvkDescriptorWrite, 3> rd = { };
+      rd[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  rd[0].descriptor = outView->getDescriptor();
+      rd[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;  rd[1].descriptor = depthView->getDescriptor();
+      rd[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  rd[2].descriptor = cVolView->getDescriptor();
+      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cRPipe);
+      cmd->bindResources(DxvkCmdBuffer::ExecBuffer, cRLayout, rd.size(), rd.data(), sizeof(cRpc), cRpc.data());
+      cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer, (cOutSize.width + 7u) / 8u, (cOutSize.height + 7u) / 8u, 1u);
+
+      // after: out is sampled by the game's passes, depth + shadow maps return to attachment use
+      barrier(CS, RW, imgStages | CS, imgAccess | VK_ACCESS_2_SHADER_READ_BIT);
+
+      cmd->track(cOut, DxvkAccess::Write);
+      cmd->track(cVol, DxvkAccess::Write);
+      cmd->track(cInj, DxvkAccess::Write);
+      cmd->track(cPrev, DxvkAccess::Read);
+      cmd->track(cDepth, DxvkAccess::Read);
+      for (const Rc<DxvkImage>& i : cLs)
+        cmd->track(i, DxvkAccess::Read);
+      if (cAtlas != nullptr) cmd->track(cAtlas, DxvkAccess::Read);
+      cmd->track(cLights, DxvkAccess::Read);
+      cmd->track(cPar, DxvkAccess::Read);
+    });
+    return D3D_OK;
+  }
+
+
   void D3D9DeviceEx::NfsuDestroy() {
     auto vk = m_dxvkDevice->vkd();
 
-    for (VkPipeline pipeline : { m_nfsuTilePipe, m_nfsuLightPipe })
+    for (VkPipeline pipeline : { m_nfsuTilePipe, m_nfsuLightPipe, m_nfsuFogPipe, m_nfsuFogResPipe })
       vk->vkDestroyPipeline(vk->device(), pipeline, nullptr);
   }
 

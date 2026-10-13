@@ -13,6 +13,8 @@ d3d9_shaders = files([
   'shaders/d3d9_fixed_function_frag_sample.frag',
   'nfsu/nfsu_cluster.comp',
   'nfsu/nfsu_light.comp',
+  'nfsu/nfsu_fog.comp',
+  'nfsu/nfsu_fogres.comp',
 ])
 
 d3d9_src = [

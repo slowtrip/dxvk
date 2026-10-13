@@ -320,4 +320,20 @@ extern "C" {
     return static_cast<D3D9DeviceEx*>(pDevice)->NfsuCluster(pDepth, pHeat, pLight, pHaze, pAtlas, pParams, pLights, LightCount);
   }
 
+  // Froxel fog, see D3D9DeviceEx::NfsuFog. pShadowMaps points to 12 textures, any of which may be null.
+  DLLEXPORT HRESULT __stdcall NFSU_FroxelFog(IDirect3DDevice9* pDevice, IDirect3DTexture9* pDepth,
+                                             IDirect3DTexture9* pOut, IDirect3DTexture9* const* pShadowMaps,
+                                             IDirect3DTexture9* pAtlas, const float* pParams,
+                                             const float* pLights, UINT LightCount) {
+    if (!pDevice)
+      return D3DERR_INVALIDCALL;
+
+    IDirect3DBaseTexture9* maps[12] = { };
+
+    for (uint32_t i = 0; i < 12; i++)
+      maps[i] = pShadowMaps ? pShadowMaps[i] : nullptr;
+
+    return static_cast<D3D9DeviceEx*>(pDevice)->NfsuFog(pDepth, pOut, maps, pAtlas, pParams, pLights, LightCount);
+  }
+
 }
