@@ -3,6 +3,7 @@
 #include "d3d9_monitor.h"
 
 #include "d3d9_hud.h"
+#include "d3d9_nfsu.h"
 #include "d3d9_window.h"
 
 namespace dxvk {
@@ -157,6 +158,20 @@ namespace dxvk {
       m_wctx->presenter->invalidateSurface();
 
     m_wctx->presenter->setSyncInterval(presentInterval);
+
+    auto counters = m_device->getStatCounters();
+
+    nfsu::SetPipelineCounts(
+      counters.getCtr(DxvkStatCounter::PipeCountGraphics),
+      counters.getCtr(DxvkStatCounter::PipeCountLibrary));
+
+    if (!std::exchange(m_nfsuLoggedInfo, true)) {
+      auto info = m_device->adapter()->info();
+
+      nfsu::OnFirstPresent(info.deviceName, info.driverName, info.driverInfo,
+        m_device->canUseGraphicsPipelineLibrary(), m_presentParams.PresentationInterval,
+        presentInterval, options->maxFrameRate);
+    }
 
     UpdatePresentRegion(pSourceRect, pDestRect);
     UpdatePresentParameters();

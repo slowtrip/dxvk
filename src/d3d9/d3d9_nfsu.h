@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 /**
  * \brief Need for Speed Underground extensions
  *
@@ -23,5 +25,24 @@ namespace dxvk::nfsu {
    * \brief Called when the application creates a D3D9 interface
    */
   void OnCreate(bool extended);
+
+  /**
+   * \brief Called once per presented frame
+   *
+   * Collects frame times and logs percentiles, hitches and the
+   * number of pipelines compiled every 600 frames.
+   */
+  void OnPresent();
+
+  /**
+   * \brief Updates the running pipeline totals used by \ref OnPresent
+   */
+  void SetPipelineCounts(uint64_t graphics, uint64_t libraries);
+
+  /**
+   * \brief Logs device and presentation info on the first present
+   */
+  void OnFirstPresent(const char* device, const char* driver, const char* driverInfo, bool gpl,
+                      uint32_t gameInterval, uint32_t effInterval, int32_t maxFrameRate);
 
 }

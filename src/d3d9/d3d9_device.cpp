@@ -1,4 +1,5 @@
 #include "d3d9_device.h"
+#include "d3d9_nfsu.h"
 
 #include "d3d9_annotation.h"
 #include "d3d9_common_texture.h"
@@ -4240,6 +4241,7 @@ namespace dxvk {
           HWND hDestWindowOverride,
     const RGNDATA* pDirtyRegion,
           DWORD dwFlags) {
+    nfsu::OnPresent();
 
     if (m_cursor.IsSoftwareCursor()) {
       D3D9_SOFTWARE_CURSOR* pSoftwareCursor = m_cursor.GetSoftwareCursor();

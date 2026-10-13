@@ -175,6 +175,7 @@ namespace dxvk {
     bool                      m_displayRefreshRateDirty = true;
 
     bool                      m_warnedAboutGDIFallback = false;
+    bool                      m_nfsuLoggedInfo = false;
 
     VkColorSpaceKHR           m_colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
 
