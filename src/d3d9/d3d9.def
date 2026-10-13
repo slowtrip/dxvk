@@ -28,3 +28,5 @@ EXPORTS
   
   Direct3DCreate9On12 @20
   Direct3DCreate9On12Ex @21
+
+  NFSU_GetVersion
