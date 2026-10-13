@@ -8,6 +8,26 @@ The most recent development builds can be found [here](https://github.com/doitsu
 
 Release builds can be found [here](https://github.com/doitsujin/dxvk/releases).
 
+## Need for Speed Underground fork
+
+This is a modified version of [DXVK](https://github.com/doitsujin/dxvk) for a graphics mod of Need for Speed Underground (2003). It adds Vulkan compute passes to the D3D9 front end that the game-side mod drives through a few functions exported from `d3d9.dll`. The game itself only ever speaks D3D9, so effects that need compute shaders, integer maths or large buffers live here. Everything else behaves like upstream DXVK, which this fork is rebased on.
+
+| Export | Purpose |
+| --- | --- |
+| `NFSU_GetVersion` | Version string of this build |
+| `NFSU_CreateStorageTexture` | RGBA16F render target that compute passes can write to |
+| `NFSU_ClusterLighting` | Per-tile light lists, lamp haze and lamp light from the scene depth |
+| `NFSU_FroxelFog` | Volumetric fog lit by every lamp, with shadowed light shafts |
+| `NFSU_Fsr` | AMD FidelityFX Super Resolution 3.1 upscaling and anti-aliasing |
+
+The passes are implemented in `src/d3d9/d3d9_nfsu_compute.cpp` and `src/d3d9/d3d9_nfsu_fsr.cpp`, with their shaders in `src/d3d9/nfsu`. Their parameters are documented next to the code. The FSR shaders come from the FidelityFX SDK and are covered by its own license, see `src/d3d9/nfsu/fsr/sdk/LICENSE.txt`.
+
+The fork also writes a log to `scripts/logs/dxvk.log` next to the game executable with frame pacing statistics and the number of pipelines compiled, and it can dump every shader the game creates when a file named `nfsu_inventory.on` exists next to the executable.
+
+Only the 32-bit `d3d9.dll` is needed. Place it next to `Speed.exe`.
+
+`src/d3d9/nfsu/test/run_d3d9_test.sh` builds a native library and runs all passes through the D3D9 front end with the Vulkan validation layer enabled.
+
 ## How to use
 In order to install a DXVK package obtained from the [release](https://github.com/doitsujin/dxvk/releases) page into a given wine prefix, copy or symlink the DLLs into the following directories as follows, then open `winecfg` and manually add `native` DLL overrides for `d3d8`, `d3d9`, `d3d10core`, `d3d11` and `dxgi` under the Libraries tab.
 
