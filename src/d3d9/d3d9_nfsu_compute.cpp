@@ -553,6 +553,9 @@ namespace dxvk {
 
     for (VkPipeline pipeline : { m_nfsuTilePipe, m_nfsuLightPipe, m_nfsuFogPipe, m_nfsuFogResPipe })
       vk->vkDestroyPipeline(vk->device(), pipeline, nullptr);
+
+    // Destroys the FSR pipelines, no CS chunk refers to the state any more
+    m_nfsuFsr = nullptr;
   }
 
 }

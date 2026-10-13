@@ -336,4 +336,14 @@ extern "C" {
     return static_cast<D3D9DeviceEx*>(pDevice)->NfsuFog(pDepth, pOut, maps, pAtlas, pParams, pLights, LightCount);
   }
 
+  // FSR 3.1 upscaler, see D3D9DeviceEx::NfsuFsr
+  DLLEXPORT HRESULT __stdcall NFSU_Fsr(IDirect3DDevice9* pDevice, IDirect3DTexture9* pColor, IDirect3DTexture9* pDepth,
+                                       IDirect3DTexture9* pMotion, IDirect3DTexture9* pReactive, IDirect3DTexture9* pOut,
+                                       const float* pParams, UINT ParamCount) {
+    if (!pDevice)
+      return D3DERR_INVALIDCALL;
+
+    return static_cast<D3D9DeviceEx*>(pDevice)->NfsuFsr(pColor, pDepth, pMotion, pReactive, pOut, pParams, ParamCount);
+  }
+
 }

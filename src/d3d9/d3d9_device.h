@@ -1103,6 +1103,20 @@ namespace dxvk {
       const float*                  pLights,
             UINT                    LightCount);
 
+    /**
+     * \brief Runs the FSR 3.1 upscaler
+     *
+     * The parameter layout is documented in d3d9_nfsu_fsr.cpp.
+     */
+    HRESULT NfsuFsr(
+            IDirect3DBaseTexture9*  pColor,
+            IDirect3DBaseTexture9*  pDepth,
+            IDirect3DBaseTexture9*  pMotion,
+            IDirect3DBaseTexture9*  pReactive,
+            IDirect3DBaseTexture9*  pOut,
+      const float*                  pParams,
+            UINT                    ParamCount);
+
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
     }
@@ -1645,6 +1659,9 @@ namespace dxvk {
     Rc<DxvkImageView>               m_nfsuFogInjView[2];
     uint32_t                        m_nfsuFogFrame     = 0u;
     bool                            m_nfsuFogLogged    = false;
+
+    // NFSU FSR upscaler state, see d3d9_nfsu_fsr.cpp
+    std::shared_ptr<struct NfsuFsrState> m_nfsuFsr;
 
     void NfsuDestroy();
 

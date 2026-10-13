@@ -33,3 +33,4 @@ EXPORTS
   NFSU_CreateStorageTexture
   NFSU_ClusterLighting
   NFSU_FroxelFog
+  NFSU_Fsr
