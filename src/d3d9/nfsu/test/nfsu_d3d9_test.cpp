@@ -80,6 +80,27 @@ static bool readback(IDirect3DDevice9* dev, IDirect3DTexture9* tex, const char* 
   return ok;
 }
 
+// one texel of a storage texture (rgba16f)
+static bool texel(IDirect3DDevice9* dev, IDirect3DTexture9* tex, UINT x, UINT y, float out[4]) {
+  D3DSURFACE_DESC d; tex->GetLevelDesc(0, &d);
+  IDirect3DSurface9 *src = nullptr, *rt = nullptr, *sys = nullptr;
+  tex->GetSurfaceLevel(0, &src);
+  HRESULT hr = dev->CreateRenderTarget(d.Width, d.Height, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &rt, nullptr);
+  if (SUCCEEDED(hr)) hr = dev->CreateOffscreenPlainSurface(d.Width, d.Height, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &sys, nullptr);
+  if (SUCCEEDED(hr)) hr = dev->StretchRect(src, nullptr, rt, nullptr, D3DTEXF_NONE);
+  if (SUCCEEDED(hr)) hr = dev->GetRenderTargetData(rt, sys);
+  D3DLOCKED_RECT lr;
+  if (SUCCEEDED(hr) && SUCCEEDED(hr = sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+    const uint16_t* p = reinterpret_cast<const uint16_t*>(static_cast<const char*>(lr.pBits) + y * lr.Pitch) + x * 4;
+    for (int c = 0; c < 4; c++) out[c] = half(p[c]);
+    sys->UnlockRect();
+  }
+  if (sys) sys->Release();
+  if (rt) rt->Release();
+  if (src) src->Release();
+  return SUCCEEDED(hr);
+}
+
 int main(int argc, char** argv) {
   const int variant = argc > 1 ? atoi(argv[1]) : 0;
   const int frames  = argc > 2 ? atoi(argv[2]) : 5;
@@ -147,6 +168,7 @@ int main(int argc, char** argv) {
     lights.insert(lights.end(), l, l + 16);
   }
 
+  float fogPar[240] = { };                                        // the fog parameters of the last frame, for the beam check
   for (int f = 0; f < frames; f++) {
     dev->BeginScene();
 
@@ -192,6 +214,7 @@ int main(int argc, char** argv) {
     CHECK(NFSU_FroxelFog(dev, depth, fogOut, ls, atlas, fp, lights.data(), UINT(lights.size() / 16)), "NFSU_FroxelFog");
     if (f == 0)                                                   // once without the atlas
       CHECK(NFSU_FroxelFog(dev, depth, fogOut, ls, nullptr, fp, lights.data(), UINT(lights.size() / 16)), "NFSU_FroxelFog (no atlas)");
+    std::memcpy(fogPar, fp, sizeof fogPar);
 
     // ---- FSR (jittered colour + depth + motion -> display-size output) ----
     float sp[32] = { };
@@ -217,6 +240,37 @@ int main(int argc, char** argv) {
     CHECK(dev->Present(nullptr, nullptr, nullptr, nullptr), "Present");
     printf("frame %d done\n", f);
     fflush(stdout);
+  }
+
+  // beam: a lamp 2 m up pointing down with a fog gain thickens the mist in the core of its cone only when noFog = -R
+  // (R m long); the old 20 m ball also thickens the air beside it. Runs without history, same lights otherwise.
+  {
+    IDirect3DTexture9* ls[12] = { lampMap[0], nullptr, lampMap[1], nullptr };
+    fogPar[94] = 0.0f;
+    std::vector<float> beamRef = lights, beamCone = lights, beamBall = lights;
+    float lamp[16] = { 2.0f, 2.0f, 8.0f, 18.0f,  1.0f, 0.8f, 0.5f, 1.0f,  0.0f, -1.0f, 0.0f, 0.8f,  0.9f, 0.0f, 0.0f, -1.0f };
+    beamRef.insert(beamRef.end(), lamp, lamp + 16);
+    lamp[13] = -6.0f; lamp[14] = 3.0f;
+    beamCone.insert(beamCone.end(), lamp, lamp + 16);
+    lamp[13] = 0.0f;
+    beamBall.insert(beamBall.end(), lamp, lamp + 16);
+    const UINT bx = UINT(0.625f * float(RW / 2)), by = UINT(0.4167f * float(RH / 2));    // 3 m under the lamp
+    const UINT sx = UINT(0.84375f * float(RW / 2)), sy = UINT(0.6667f * float(RH / 2));  // 3.5 m beside it, same height
+    float r0[4] = { }, r1[4] = { }, k0[4] = { }, k1[4] = { }, o0[4] = { }, o1[4] = { };
+    struct { const std::vector<float>* list; float *under, *side; const char* what; } bruns[3] = {
+      { &beamRef, r0, r1, "beam reference" }, { &beamCone, k0, k1, "beam in the cone" }, { &beamBall, o0, o1, "beam as a ball" } };
+    bool ok = true;
+    for (int r = 0; r < 3; r++) {
+      dev->BeginScene();
+      CHECK(NFSU_FroxelFog(dev, depth, fogOut, ls, atlas, fogPar, bruns[r].list->data(), UINT(bruns[r].list->size() / 16)), bruns[r].what);
+      dev->EndScene();
+      ok = ok && texel(dev, fogOut, bx, by, bruns[r].under) && texel(dev, fogOut, sx, sy, bruns[r].side);
+    }
+    bool thick = k0[3] < r0[3] * 0.9f, beside = std::fabs(k1[3] - r1[3]) < 0.03f, ball = o1[3] < r1[3] - 0.03f;
+    ok = ok && thick && beside && ball;
+    printf("%s beam: transmittance under the lamp %.3f -> %.3f; beside it %.3f -> %.3f (as a 20 m ball %.3f)\n",
+           ok ? "ok  " : "FAIL", r0[3], k0[3], r1[3], k1[3], o1[3]);
+    if (!ok) g_fail++;
   }
 
   // outputs must contain something (and finite numbers)

@@ -9,6 +9,9 @@
 layout(local_size_x = 64) in;
 
 struct Light { vec4 posRange; vec4 colR0; vec4 dirCos; vec4 extra; };   // extra: cosInner, noFog, fogGain, shadowSlot
+// fogGain thickens the mist near the light so its beam shows. By default that is a 20 m ball around it; a negative
+// noFog of -R makes it a beam instead: R metres long, in the core of the light's cone (from cosInner to a quarter of
+// the way in), where the light also scatters (1 + fogGain) times more, so the shaft stands out against the mist.
 layout(std430, set = 0, binding = 0) readonly buffer Lights { Light L[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Params { vec4 P[60]; };   // [24..39] lamp 2..5 VP rows, [40] their map flags
 // atlas lamps: [42..57] per tile: baked lamp position xyz (world), w = weight (rank fade, 0 = tile unused);
@@ -162,11 +165,18 @@ void main() {
     vec3 Lv = Li.posRange.xyz - pv;
     float d2 = dot(Lv, Lv);
     float r2 = Li.posRange.w * Li.posRange.w;
-    fog += Li.extra.z * clamp(1.0 - d2 / 400.0, 0.0, 1.0);       // within 20 m of a floodlight
-    if (d2 >= r2) continue;
     float dist = sqrt(d2);
+    float ca = dot(-Lv / max(dist, 0.001), Li.dirCos.xyz);
+    float spot = smoothstep(Li.dirCos.w, Li.extra.x, ca);
+    float gain = Li.extra.z;
+    if (Li.extra.y < -0.5) {                                       // beam: the cone's core only, R metres long
+      float core = smoothstep(Li.extra.x, 1.0 - (1.0 - Li.extra.x) * 0.25, ca);
+      gain *= core;
+      fog += gain * clamp(1.0 - d2 / (Li.extra.y * Li.extra.y), 0.0, 1.0);
+    } else
+      fog += gain * clamp(1.0 - d2 / 400.0, 0.0, 1.0);           // within 20 m of a floodlight
+    if (d2 >= r2) continue;
     float win = clamp(1.0 - d2 * d2 / (r2 * r2), 0.0, 1.0);
-    float spot = smoothstep(Li.dirCos.w, Li.extra.x, dot(-Lv / max(dist, 0.001), Li.dirCos.xyz));
     float vis = 1.0;
     if (Li.extra.w > 5.5) {                                        // atlas lamp: beams cut by its baked static map
       int t = int(Li.extra.w - 6.0 + 0.5);
@@ -178,7 +188,7 @@ void main() {
       if (lw > 0.0) vis = mix(1.0, lsVis(pw, slot), clamp(lw, 0.0, 1.0));
     }
     float wgt = Li.dirCos.w < -1.5 ? pc.size.w : 1.0;              // omni point lights (lanterns): fog weight
-    sc += Li.colR0.rgb * (wgt * (1.0 + Li.extra.z) * win * win * spot * vis / (1.0 + d2 / (Li.colR0.w * Li.colR0.w)));
+    sc += Li.colR0.rgb * (wgt * (1.0 + gain) * win * win * spot * vis / (1.0 + d2 / (Li.colR0.w * Li.colR0.w)));
   }
   if (fog > 0.0) dens += P[5].x * fog * 0.5 * (0.35 + 1.3 * noise3((pw - wind) * P[6].x * 1.7));
   vec3 scat = vec3(1.0) - exp(-sc);                                // lamps saturate softly
